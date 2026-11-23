@@ -11,6 +11,18 @@ public interface IProcessManager
   IProcess[] GetProcesses();
   IProcess[] GetProcessesByName(string processName);
   Task<Result<string>> GetProcessOutput(string command, string arguments, int timeoutMs = 10_000);
+
+  /// <summary>
+  /// Runs a command with one argument per list entry, so values are not parsed by a shell.
+  /// A non-zero exit is still success. When <paramref name="includeStandardError"/> is set, stderr is
+  /// appended to the returned text. A timeout is a failure and the process tree is killed.
+  /// </summary>
+  Task<Result<string>> GetProcessOutput(
+    string fileName,
+    IReadOnlyList<string> arguments,
+    int timeoutMs = 10_000,
+    bool includeStandardError = false);
+
   Task<Result<string>> GetProcessOutputStrict(string command, string arguments, int timeoutMs = 10_000);
   IProcess? LaunchUri(Uri uri);
   IProcess Start(string fileName);
@@ -54,6 +66,84 @@ public class ProcessManager : IProcessManager
   public async Task<Result<string>> GetProcessOutput(string command, string arguments, int timeoutMs = 10_000)
   {
     return await GetProcessOutputCore(command, arguments, timeoutMs, requireZeroExitCode: false);
+  }
+
+  public async Task<Result<string>> GetProcessOutput(
+    string fileName,
+    IReadOnlyList<string> arguments,
+    int timeoutMs = 10_000,
+    bool includeStandardError = false)
+  {
+    Process? process = null;
+    try
+    {
+      var startInfo = new ProcessStartInfo
+      {
+        FileName = fileName,
+        WindowStyle = ProcessWindowStyle.Hidden,
+        UseShellExecute = false,
+        RedirectStandardOutput = true,
+        RedirectStandardError = includeStandardError
+      };
+
+      foreach (var argument in arguments)
+      {
+        startInfo.ArgumentList.Add(argument);
+      }
+
+      process = Process.Start(startInfo);
+      if (process is null)
+      {
+        return Result.Fail<string>("Process failed to start.");
+      }
+
+      using var timeout = new CancellationTokenSource(timeoutMs);
+      var stdoutTask = process.StandardOutput.ReadToEndAsync(timeout.Token);
+      var stderrTask = includeStandardError
+        ? process.StandardError.ReadToEndAsync(timeout.Token)
+        : Task.FromResult(string.Empty);
+
+      try
+      {
+        await process.WaitForExitAsync(timeout.Token);
+      }
+      catch (OperationCanceledException)
+      {
+        // launchctl print can sit forever on a gui domain. Kill it so the next check does not
+        // pile another copy on top of one that will never exit.
+        KillProcessTree(process);
+        await DrainProcessOutput(stdoutTask, stderrTask);
+        return Result.Fail<string>(
+          $"Timed out while waiting for command to finish.  Command: {fileName}.  Arguments: {string.Join(' ', arguments)}");
+      }
+
+      var stdout = await stdoutTask;
+      var stderr = await stderrTask;
+      if (string.IsNullOrEmpty(stderr))
+      {
+        return Result.Ok(stdout);
+      }
+
+      if (string.IsNullOrEmpty(stdout))
+      {
+        return Result.Ok(stderr);
+      }
+
+      return Result.Ok(stdout + "\n" + stderr);
+    }
+    catch (Exception ex)
+    {
+      if (process is not null)
+      {
+        KillProcessTree(process);
+      }
+
+      return Result.Fail<string>(ex);
+    }
+    finally
+    {
+      process?.Dispose();
+    }
   }
 
   public async Task<Result<string>> GetProcessOutputStrict(string command, string arguments, int timeoutMs = 10_000)
@@ -140,6 +230,33 @@ public class ProcessManager : IProcessManager
     Guard.IsNotNull(process);
     await process.WaitForExitAsync(cancellationToken);
     return process.ExitCode;
+  }
+
+  private static async Task DrainProcessOutput(Task<string> stdoutTask, Task<string> stderrTask)
+  {
+    try
+    {
+      await Task.WhenAll(stdoutTask, stderrTask);
+    }
+    catch (Exception)
+    {
+      // The timed-out process was killed. Reading its pipes can fail once they close.
+    }
+  }
+
+  private static void KillProcessTree(Process process)
+  {
+    try
+    {
+      if (!process.HasExited)
+      {
+        process.Kill(entireProcessTree: true);
+      }
+    }
+    catch (Exception)
+    {
+      // The process can exit between the check and the kill.
+    }
   }
 
   private async Task<Result<string>> GetProcessOutputCore(
