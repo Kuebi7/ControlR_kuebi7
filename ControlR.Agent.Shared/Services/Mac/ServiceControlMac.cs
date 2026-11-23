@@ -285,8 +285,12 @@ internal class ServiceControlMac(
         // Might fail if already loaded, which is okay
       }
 
-      // Kickstart the service
-      psi.Arguments = $"launchctl kickstart -k gui/{uid}/{serviceName}";
+      // kickstart -k sends SIGKILL (signal 9). launchd records that as "Killed: 9" and counts a new run.
+      // The desktop watcher calls start when it thinks the job is down, and a launchctl print that
+      // timed out used to look the same as a missing job, so -k was ending healthy remote-control
+      // sessions. Without -k, kickstart starts a job that is not running and leaves a running one
+      // alone. Install and repair boot the job out before they call this.
+      psi.Arguments = $"launchctl kickstart gui/{uid}/{serviceName}";
       await _processManager.StartAndWaitForExit(psi, _serviceStatusTimeout);
 
       _logger.LogDebug("Desktop client service started successfully for user {UID}.", uid);
